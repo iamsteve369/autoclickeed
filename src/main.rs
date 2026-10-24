@@ -1,6 +1,5 @@
-// CPS Boost: tiny background click-rate booster for Windows.
-// Idle cost: the main thread blocks in GetMessage and the worker thread is parked,
-// so CPU use is ~0% until you actually click fast.
+// CPS Boost: tiny background click-rate booster for Windows (left + right button).
+// Idle cost: main thread blocks in GetMessage and worker threads are parked => ~0% CPU.
 //
 // Hotkeys:  Ctrl+Alt+B = pause/resume     Ctrl+Alt+Q = quit
 #![windows_subsystem = "windows"] // no console window
@@ -19,54 +18,82 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ---- Settings (edit these, then rebuild) ----
 const TRIGGER_CPS: usize = 6; // real CPS needed to activate
-const MIN_TARGET_CPS: u64 = 12; // boosted rate range
+const MIN_TARGET_CPS: u64 = 14; // boosted rate range (set both equal for a fixed rate)
 const MAX_TARGET_CPS: u64 = 20;
-const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after your last real click
+const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after you release the button
+const BUTTON_ENABLED: [bool; 2] = [true, true]; // [left, right]
 
+const FLAGS: [(u32, u32); 2] = [
+    (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+    (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+];
+
+struct Btn {
+    down: AtomicBool,
+    boosting: AtomicBool,
+    last_ms: AtomicU64,
+    clicks: Mutex<VecDeque<Instant>>,
+    worker: OnceLock<Thread>,
+}
+
+impl Btn {
+    const fn new() -> Self {
+        Btn {
+            down: AtomicBool::new(false),
+            boosting: AtomicBool::new(false),
+            last_ms: AtomicU64::new(0),
+            clicks: Mutex::new(VecDeque::new()),
+            worker: OnceLock::new(),
+        }
+    }
+}
+
+static BTNS: [Btn; 2] = [Btn::new(), Btn::new()]; // 0 = left, 1 = right
 static ENABLED: AtomicBool = AtomicBool::new(true);
-static BOOSTING: AtomicBool = AtomicBool::new(false);
-static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
-static LAST_REAL_CLICK_MS: AtomicU64 = AtomicU64::new(0);
-static CLICKS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 static START: OnceLock<Instant> = OnceLock::new();
-static WORKER: OnceLock<Thread> = OnceLock::new();
 
 fn now_ms() -> u64 {
     START.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0)
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
-    if code >= 0 {
+    if code >= 0 && ENABLED.load(Relaxed) {
         let info = &*(lparam as *const MSLLHOOKSTRUCT);
         // Ignore clicks we injected ourselves (prevents a feedback loop).
-        if info.flags & LLMHF_INJECTED == 0 && ENABLED.load(Relaxed) {
-            match wparam as u32 {
-                WM_LBUTTONDOWN => {
-                    LEFT_DOWN.store(true, Relaxed);
-                    on_real_click();
-                    // While boosting, hide real clicks so the game only sees one clean stream.
-                    if BOOSTING.load(Relaxed) {
+        if info.flags & LLMHF_INJECTED == 0 {
+            let hit = match wparam as u32 {
+                WM_LBUTTONDOWN => Some((0usize, true)),
+                WM_LBUTTONUP => Some((0, false)),
+                WM_RBUTTONDOWN => Some((1, true)),
+                WM_RBUTTONUP => Some((1, false)),
+                _ => None,
+            };
+            if let Some((i, is_down)) = hit {
+                if BUTTON_ENABLED[i] {
+                    let b = &BTNS[i];
+                    if is_down {
+                        b.down.store(true, Relaxed);
+                        on_real_click(i);
+                    } else {
+                        b.down.store(false, Relaxed);
+                    }
+                    // While boosting, hide real clicks so the game sees one clean stream.
+                    if b.boosting.load(Relaxed) {
                         return 1;
                     }
                 }
-                WM_LBUTTONUP => {
-                    LEFT_DOWN.store(false, Relaxed);
-                    if BOOSTING.load(Relaxed) {
-                        return 1;
-                    }
-                }
-                _ => {}
             }
         }
     }
     CallNextHookEx(0, code, wparam, lparam)
 }
 
-fn on_real_click() {
+fn on_real_click(i: usize) {
+    let b = &BTNS[i];
     let now = Instant::now();
-    LAST_REAL_CLICK_MS.store(now_ms(), Relaxed);
+    b.last_ms.store(now_ms(), Relaxed);
     let count = {
-        let mut q = match CLICKS.lock() {
+        let mut q = match b.clicks.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -80,8 +107,8 @@ fn on_real_click() {
         }
         q.len()
     };
-    if count >= TRIGGER_CPS && !BOOSTING.swap(true, Relaxed) {
-        if let Some(w) = WORKER.get() {
+    if count >= TRIGGER_CPS && !b.boosting.swap(true, Relaxed) {
+        if let Some(w) = b.worker.get() {
             w.unpark();
         }
     }
@@ -103,8 +130,10 @@ fn send_mouse(flag: u32) {
     }
 }
 
-fn worker() {
-    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ (Instant::now().elapsed().as_nanos() as u64);
+fn worker(i: usize) {
+    let b = &BTNS[i];
+    let (down_flag, up_flag) = FLAGS[i];
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15 ^ ((i as u64 + 1) << 32) ^ (Instant::now().elapsed().as_nanos() as u64);
     let mut rand = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -112,30 +141,30 @@ fn worker() {
         seed
     };
     loop {
-        if !BOOSTING.load(Relaxed) {
+        if !b.boosting.load(Relaxed) {
             thread::park(); // fully asleep while idle
             continue;
         }
         unsafe { timeBeginPeriod(1) }; // precise sleeps, only while boosting
         loop {
-            let idle = now_ms().saturating_sub(LAST_REAL_CLICK_MS.load(Relaxed));
-            if !ENABLED.load(Relaxed) || (!LEFT_DOWN.load(Relaxed) && idle > STOP_AFTER_IDLE_MS) {
+            let idle = now_ms().saturating_sub(b.last_ms.load(Relaxed));
+            if !ENABLED.load(Relaxed) || (!b.down.load(Relaxed) && idle > STOP_AFTER_IDLE_MS) {
                 break;
             }
             let rate = MIN_TARGET_CPS + rand() % (MAX_TARGET_CPS - MIN_TARGET_CPS + 1);
             let hold_us = 1000 + (rand() % 4001); // 1-5 ms button hold
-            send_mouse(MOUSEEVENTF_LEFTDOWN);
+            send_mouse(down_flag);
             thread::sleep(Duration::from_micros(hold_us));
-            send_mouse(MOUSEEVENTF_LEFTUP);
+            send_mouse(up_flag);
             let period = 1_000_000 / rate;
             thread::sleep(Duration::from_micros(period.saturating_sub(hold_us)));
         }
         unsafe { timeEndPeriod(1) };
-        BOOSTING.store(false, Relaxed);
+        b.boosting.store(false, Relaxed);
         // Re-check: a click may have arrived just as we were stopping.
-        let idle = now_ms().saturating_sub(LAST_REAL_CLICK_MS.load(Relaxed));
-        if ENABLED.load(Relaxed) && (LEFT_DOWN.load(Relaxed) || idle <= STOP_AFTER_IDLE_MS) {
-            BOOSTING.store(true, Relaxed);
+        let idle = now_ms().saturating_sub(b.last_ms.load(Relaxed));
+        if ENABLED.load(Relaxed) && (b.down.load(Relaxed) || idle <= STOP_AFTER_IDLE_MS) {
+            b.boosting.store(true, Relaxed);
         }
     }
 }
@@ -154,17 +183,19 @@ fn main() {
     // Single-instance guard: a second copy just tells you and exits.
     unsafe {
         let name = wide("Local\\CpsBoostSingleInstance");
-        let _m = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        let m = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
         if GetLastError() == 183 {
             popup("CPS Boost is already running.\nPress Ctrl+Alt+Q to quit it.");
             return;
         }
-        std::mem::forget(_m); // keep the mutex for the life of the program
+        std::mem::forget(m); // keep the mutex for the life of the program
     }
-    thread::spawn(|| popup("CPS Boost is running.\nCtrl+Alt+B = pause/resume\nCtrl+Alt+Q = quit"));
+    thread::spawn(|| popup("CPS Boost is running (left + right click).\nCtrl+Alt+B = pause/resume\nCtrl+Alt+Q = quit"));
     let _ = START.set(Instant::now());
-    let handle = thread::spawn(worker);
-    let _ = WORKER.set(handle.thread().clone());
+    for i in 0..2 {
+        let h = thread::spawn(move || worker(i));
+        let _ = BTNS[i].worker.set(h.thread().clone());
+    }
 
     unsafe {
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), 0, 0);
