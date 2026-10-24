@@ -19,6 +19,10 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+// Fixed Windows values defined here so no extra library features are needed.
+const BST_CHECKED: isize = 1;
+const COLOR_WINDOW_IDX: isize = 5;
+
 const TRIGGER_CPS: usize = 4; // real clicks per second needed to activate
 const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after you release the button
 
@@ -218,7 +222,7 @@ static H_EDIT: AtomicIsize = AtomicIsize::new(0);
 unsafe extern "system" fn dlg_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
     match msg {
         WM_COMMAND if (wparam & 0xFFFF) == 100 => {
-            let checked = BST_CHECKED as isize;
+            let checked: isize = BST_CHECKED;
             let l = SendMessageW(H_CHK[0].load(Relaxed), BM_GETCHECK, 0, 0) == checked;
             let r = SendMessageW(H_CHK[1].load(Relaxed), BM_GETCHECK, 0, 0) == checked;
             let mut buf = [0u16; 16];
@@ -285,7 +289,7 @@ unsafe fn show_start_window() -> bool {
     wc.lpfnWndProc = Some(dlg_proc);
     wc.hInstance = hinst;
     wc.hCursor = LoadCursorW(0, IDC_ARROW);
-    wc.hbrBackground = (COLOR_WINDOW + 1) as isize;
+    wc.hbrBackground = COLOR_WINDOW_IDX + 1;
     wc.lpszClassName = class.as_ptr();
     RegisterClassW(&wc);
 
