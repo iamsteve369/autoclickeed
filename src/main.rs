@@ -1,32 +1,35 @@
 // CPS Boost: tiny background click-rate booster for Windows (left + right button).
+// A small settings window appears at start: pick buttons + clicks per second, press Start.
 // Idle cost: main thread blocks in GetMessage and worker threads are parked => ~0% CPU.
 //
 // Hotkeys:  Ctrl+Alt+B = pause/resume     Ctrl+Alt+Q = quit
 #![windows_subsystem = "windows"] // no console window
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ---- Settings (edit these, then rebuild) ----
-const TRIGGER_CPS: usize = 6; // real CPS needed to activate
-const MIN_TARGET_CPS: u64 = 14; // boosted rate range (set both equal for a fixed rate)
-const MAX_TARGET_CPS: u64 = 20;
+const TRIGGER_CPS: usize = 4; // real clicks per second needed to activate
 const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after you release the button
-const BUTTON_ENABLED: [bool; 2] = [true, true]; // [left, right]
 
 const FLAGS: [(u32, u32); 2] = [
     (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
     (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
 ];
+
+// ---- Settings chosen in the start window ----
+static TARGET_CPS: AtomicU64 = AtomicU64::new(20);
+static BUTTON_ENABLED: [AtomicBool; 2] = [AtomicBool::new(true), AtomicBool::new(true)]; // [left, right]
 
 struct Btn {
     down: AtomicBool,
@@ -69,7 +72,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) ->
                 _ => None,
             };
             if let Some((i, is_down)) = hit {
-                if BUTTON_ENABLED[i] {
+                if BUTTON_ENABLED[i].load(Relaxed) {
                     let b = &BTNS[i];
                     if is_down {
                         b.down.store(true, Relaxed);
@@ -151,7 +154,7 @@ fn worker(i: usize) {
             if !ENABLED.load(Relaxed) || (!b.down.load(Relaxed) && idle > STOP_AFTER_IDLE_MS) {
                 break;
             }
-            let rate = MIN_TARGET_CPS + rand() % (MAX_TARGET_CPS - MIN_TARGET_CPS + 1);
+            let rate = TARGET_CPS.load(Relaxed).max(1);
             let hold_us = 1000 + (rand() % 4001); // 1-5 ms button hold
             send_mouse(down_flag);
             thread::sleep(Duration::from_micros(hold_us));
@@ -179,6 +182,153 @@ fn popup(text: &str) {
     unsafe { MessageBoxW(0, t.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION) };
 }
 
+// ---- Saved settings (file next to the exe) ----
+fn config_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("cps-boost-settings.txt")))
+}
+
+fn load_config() -> (bool, bool, u64) {
+    let (mut l, mut r, mut cps) = (true, true, 20u64);
+    if let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "left" => l = v.trim() == "1",
+                    "right" => r = v.trim() == "1",
+                    "cps" => cps = v.trim().parse().unwrap_or(20).clamp(1, 100),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (l, r, cps)
+}
+
+fn save_config(l: bool, r: bool, cps: u64) {
+    if let Some(p) = config_path() {
+        let _ = std::fs::write(p, format!("left={}\nright={}\ncps={}\n", l as u8, r as u8, cps));
+    }
+}
+
+// ---- Start window ----
+static STARTED: AtomicBool = AtomicBool::new(false);
+static H_CHK: [AtomicIsize; 2] = [AtomicIsize::new(0), AtomicIsize::new(0)];
+static H_EDIT: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn dlg_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    match msg {
+        WM_COMMAND if (wparam & 0xFFFF) == 100 => {
+            let checked = BST_CHECKED as isize;
+            let l = SendMessageW(H_CHK[0].load(Relaxed), BM_GETCHECK, 0, 0) == checked;
+            let r = SendMessageW(H_CHK[1].load(Relaxed), BM_GETCHECK, 0, 0) == checked;
+            let mut buf = [0u16; 16];
+            let n = GetWindowTextW(H_EDIT.load(Relaxed), buf.as_mut_ptr(), 16);
+            let cps = String::from_utf16_lossy(&buf[..n.max(0) as usize])
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(20)
+                .clamp(1, 100);
+            if !l && !r {
+                popup("Please tick at least one button.");
+                return 0;
+            }
+            BUTTON_ENABLED[0].store(l, Relaxed);
+            BUTTON_ENABLED[1].store(r, Relaxed);
+            TARGET_CPS.store(cps, Relaxed);
+            save_config(l, r, cps);
+            STARTED.store(true, Relaxed);
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn make_ctl(
+    parent: isize,
+    hinst: isize,
+    class: &str,
+    text: &str,
+    style: u32,
+    (x, y, w, h): (i32, i32, i32, i32),
+    id: isize,
+) -> isize {
+    let c = wide(class);
+    let t = wide(text);
+    let hw = CreateWindowExW(
+        0,
+        c.as_ptr(),
+        t.as_ptr(),
+        style | WS_CHILD as u32 | WS_VISIBLE as u32,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        id,
+        hinst,
+        std::ptr::null(),
+    );
+    SendMessageW(hw, WM_SETFONT, GetStockObject(DEFAULT_GUI_FONT) as usize, 1);
+    hw
+}
+
+/// Shows the settings window. Returns true if the user pressed Start.
+unsafe fn show_start_window() -> bool {
+    let hinst = GetModuleHandleW(std::ptr::null());
+    let class = wide("CpsBoostStart");
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(dlg_proc);
+    wc.hInstance = hinst;
+    wc.hCursor = LoadCursorW(0, IDC_ARROW);
+    wc.hbrBackground = (COLOR_WINDOW + 1) as isize;
+    wc.lpszClassName = class.as_ptr();
+    RegisterClassW(&wc);
+
+    let title = wide("CPS Boost");
+    let hwnd = CreateWindowExW(
+        0,
+        class.as_ptr(),
+        title.as_ptr(),
+        WS_OVERLAPPED as u32 | WS_CAPTION as u32 | WS_SYSMENU as u32 | WS_VISIBLE as u32,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        300,
+        250,
+        0,
+        0,
+        hinst,
+        std::ptr::null(),
+    );
+    if hwnd == 0 {
+        return false;
+    }
+    let (l, r, cps) = load_config();
+    make_ctl(hwnd, hinst, "STATIC", "Choose which buttons to boost:", 0, (15, 12, 260, 20), 0);
+    let hl = make_ctl(hwnd, hinst, "BUTTON", "Left click", BS_AUTOCHECKBOX as u32 | WS_TABSTOP as u32, (30, 38, 200, 22), 1);
+    let hr = make_ctl(hwnd, hinst, "BUTTON", "Right click", BS_AUTOCHECKBOX as u32 | WS_TABSTOP as u32, (30, 62, 200, 22), 2);
+    make_ctl(hwnd, hinst, "STATIC", "Clicks per second (1-100):", 0, (15, 100, 170, 20), 0);
+    let he = make_ctl(hwnd, hinst, "EDIT", &cps.to_string(), WS_BORDER as u32 | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP as u32, (190, 97, 60, 22), 3);
+    make_ctl(hwnd, hinst, "STATIC", "Pause: Ctrl+Alt+B   Quit: Ctrl+Alt+Q", 0, (15, 132, 260, 20), 0);
+    make_ctl(hwnd, hinst, "BUTTON", "Start", BS_DEFPUSHBUTTON as u32 | WS_TABSTOP as u32, (90, 165, 110, 30), 100);
+    SendMessageW(hl, BM_SETCHECK, l as usize, 0);
+    SendMessageW(hr, BM_SETCHECK, r as usize, 0);
+    H_CHK[0].store(hl, Relaxed);
+    H_CHK[1].store(hr, Relaxed);
+    H_EDIT.store(he, Relaxed);
+
+    let mut msg: MSG = std::mem::zeroed();
+    while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    STARTED.load(Relaxed)
+}
+
 fn main() {
     // Single-instance guard: a second copy just tells you and exits.
     unsafe {
@@ -190,7 +340,11 @@ fn main() {
         }
         std::mem::forget(m); // keep the mutex for the life of the program
     }
-    thread::spawn(|| popup("CPS Boost is running (left + right click).\nCtrl+Alt+B = pause/resume\nCtrl+Alt+Q = quit"));
+
+    if !unsafe { show_start_window() } {
+        return; // window closed without pressing Start
+    }
+
     let _ = START.set(Instant::now());
     for i in 0..2 {
         let h = thread::spawn(move || worker(i));
