@@ -18,9 +18,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ---- Settings (edit these, then rebuild) ----
-const TRIGGER_CPS: usize = 4; // real CPS needed to activate
-const MIN_TARGET_CPS: u64 = 20; // boosted rate range
-const MAX_TARGET_CPS: u64 = 25;
+const TRIGGER_CPS: usize = 6; // real CPS needed to activate
+const MIN_TARGET_CPS: u64 = 12; // boosted rate range
+const MAX_TARGET_CPS: u64 = 20;
 const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after your last real click
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
