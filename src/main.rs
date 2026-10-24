@@ -18,13 +18,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ---- Settings (edit these, then rebuild) ----
-const TRIGGER_CPS: usize = 6; // real CPS needed to activate
+const TRIGGER_CPS: usize = 4; // real CPS needed to activate
 const MIN_TARGET_CPS: u64 = 20; // boosted rate range
 const MAX_TARGET_CPS: u64 = 25;
-const STOP_AFTER_IDLE_MS: u64 = 350; // stop boosting this long after your last real click
+const STOP_AFTER_IDLE_MS: u64 = 300; // stop boosting this long after your last real click
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static BOOSTING: AtomicBool = AtomicBool::new(false);
+static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 static LAST_REAL_CLICK_MS: AtomicU64 = AtomicU64::new(0);
 static CLICKS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 static START: OnceLock<Instant> = OnceLock::new();
@@ -35,11 +36,27 @@ fn now_ms() -> u64 {
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: usize, lparam: isize) -> isize {
-    if code >= 0 && wparam as u32 == WM_LBUTTONDOWN {
+    if code >= 0 {
         let info = &*(lparam as *const MSLLHOOKSTRUCT);
         // Ignore clicks we injected ourselves (prevents a feedback loop).
         if info.flags & LLMHF_INJECTED == 0 && ENABLED.load(Relaxed) {
-            on_real_click();
+            match wparam as u32 {
+                WM_LBUTTONDOWN => {
+                    LEFT_DOWN.store(true, Relaxed);
+                    on_real_click();
+                    // While boosting, hide real clicks so the game only sees one clean stream.
+                    if BOOSTING.load(Relaxed) {
+                        return 1;
+                    }
+                }
+                WM_LBUTTONUP => {
+                    LEFT_DOWN.store(false, Relaxed);
+                    if BOOSTING.load(Relaxed) {
+                        return 1;
+                    }
+                }
+                _ => {}
+            }
         }
     }
     CallNextHookEx(0, code, wparam, lparam)
@@ -70,21 +87,19 @@ fn on_real_click() {
     }
 }
 
-fn send_click() {
+fn send_mouse(flag: u32) {
     unsafe {
-        let mut inputs: [INPUT; 2] = std::mem::zeroed();
-        for (i, flag) in [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].iter().enumerate() {
-            inputs[i].r#type = INPUT_MOUSE;
-            inputs[i].Anonymous.mi = MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: 0,
-                dwFlags: *flag,
-                time: 0,
-                dwExtraInfo: 0,
-            };
-        }
-        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+        let mut input: INPUT = std::mem::zeroed();
+        input.r#type = INPUT_MOUSE;
+        input.Anonymous.mi = MOUSEINPUT {
+            dx: 0,
+            dy: 0,
+            mouseData: 0,
+            dwFlags: flag,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
@@ -104,17 +119,23 @@ fn worker() {
         unsafe { timeBeginPeriod(1) }; // precise sleeps, only while boosting
         loop {
             let idle = now_ms().saturating_sub(LAST_REAL_CLICK_MS.load(Relaxed));
-            if !ENABLED.load(Relaxed) || idle > STOP_AFTER_IDLE_MS {
+            if !ENABLED.load(Relaxed) || (!LEFT_DOWN.load(Relaxed) && idle > STOP_AFTER_IDLE_MS) {
                 break;
             }
-            send_click();
             let rate = MIN_TARGET_CPS + rand() % (MAX_TARGET_CPS - MIN_TARGET_CPS + 1);
-            thread::sleep(Duration::from_micros(1_000_000 / rate));
+            let hold_us = 1000 + (rand() % 4001); // 1-5 ms button hold
+            send_mouse(MOUSEEVENTF_LEFTDOWN);
+            thread::sleep(Duration::from_micros(hold_us));
+            send_mouse(MOUSEEVENTF_LEFTUP);
+            let period = 1_000_000 / rate;
+            thread::sleep(Duration::from_micros(period.saturating_sub(hold_us)));
         }
         unsafe { timeEndPeriod(1) };
         BOOSTING.store(false, Relaxed);
-        if let Ok(mut q) = CLICKS.lock() {
-            q.clear();
+        // Re-check: a click may have arrived just as we were stopping.
+        let idle = now_ms().saturating_sub(LAST_REAL_CLICK_MS.load(Relaxed));
+        if ENABLED.load(Relaxed) && (LEFT_DOWN.load(Relaxed) || idle <= STOP_AFTER_IDLE_MS) {
+            BOOSTING.store(true, Relaxed);
         }
     }
 }
