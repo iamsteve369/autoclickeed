@@ -11,7 +11,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -117,7 +119,28 @@ fn worker() {
     }
 }
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn popup(text: &str) {
+    let t = wide(text);
+    let title = wide("CPS Boost");
+    unsafe { MessageBoxW(0, t.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION) };
+}
+
 fn main() {
+    // Single-instance guard: a second copy just tells you and exits.
+    unsafe {
+        let name = wide("Local\\CpsBoostSingleInstance");
+        let _m = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if GetLastError() == 183 {
+            popup("CPS Boost is already running.\nPress Ctrl+Alt+Q to quit it.");
+            return;
+        }
+        std::mem::forget(_m); // keep the mutex for the life of the program
+    }
+    thread::spawn(|| popup("CPS Boost is running.\nCtrl+Alt+B = pause/resume\nCtrl+Alt+Q = quit"));
     let _ = START.set(Instant::now());
     let handle = thread::spawn(worker);
     let _ = WORKER.set(handle.thread().clone());
